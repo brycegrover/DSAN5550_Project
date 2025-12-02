@@ -1,35 +1,28 @@
 #!/usr/bin/env python3
 """
-Vessel and sea ice analysis (revised).
+vessel_ice_models.py
 
-Reads:
-    processed/features/features_with_targets.parquet
+Models next-month vessel activity as a function of ice and spatiotemporal features.
+Creates PNG plots for poster use and writes metrics plus CodeCarbon emissions.
 
-Performs, on *active* grid cells (cells that ever see vessels):
-    - EDA: probability of vessel presence vs ice concentration
-    - Logistic regression for next-month presence using ice + season only
-    - Random Forest classifier for next-month presence using full features
-    - Random Forest regressor for next-month counts
+Assumes project layout:
 
-Writes:
-    processed/analysis/
-        eda_prob_vs_ice_active.png
-        logistic_next_roc.png
-        rf_classifier_roc.png
-        rf_classifier_feature_importance.png
-        rf_regressor_scatter.png
-        metrics.txt
-        emissions.csv   (if CodeCarbon is installed)
+Project/
+  processed/
+    features/features_with_targets.parquet
+    analysis/           <-- plots and metrics will be written here
+
 """
 
 from pathlib import Path
+import os
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
 from sklearn.metrics import (
     roc_curve,
-    roc_auc_score,
+    auc,
     confusion_matrix,
     classification_report,
     mean_squared_error,
@@ -39,470 +32,428 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-
-# Optional: CodeCarbon for emissions tracking
-try:
-    from codecarbon import EmissionsTracker
-
-    HAS_CODEC = True
-except ImportError:
-    HAS_CODEC = False
-
-# ---------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_PATH = PROJECT_ROOT / "processed" / "features" / "features_with_targets.parquet"
-OUT_DIR = PROJECT_ROOT / "processed" / "analysis"
+from codecarbon import EmissionsTracker
 
 
-# ---------------------------------------------------------------------
-# Data loading and filtering
-# ---------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Paths and constants
+# -------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+PROCESSED_DIR = BASE_DIR / "processed"
+FEATURES_DIR = PROCESSED_DIR / "features"
+FEATURES_PATH = FEATURES_DIR / "features_with_targets.parquet"
+ANALYSIS_DIR = PROCESSED_DIR / "analysis"
+
+ACTIVE_CELL_MIN_TOTAL_VESSELS = 5  # minimum total vessels to count a cell as active
+TRAIN_FRACTION = 0.8               # fractional cutoff in time index t
 
 
-def load_data() -> pd.DataFrame:
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(
-            f"{DATA_PATH} not found. Run scripts/build_targets.py first."
-        )
+# -------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------
 
-    df = pd.read_parquet(DATA_PATH)
+def ensure_output_dir():
+    ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
-    expected = {
-        "iy",
-        "ix",
-        "lat",
-        "lon",
-        "ice_conc_mean",
-        "year",
-        "month",
-        "vessel_count",
-        "t",
-        "ice_conc_prev",
-        "vessel_count_prev",
-        "delta_ice",
-        "has_vessel",
-        "vessel_count_next",
-        "has_vessel_next",
-    }
-    missing = expected.difference(df.columns)
-    if missing:
-        raise ValueError(f"Missing expected columns in features_with_targets: {missing}")
 
-    # Drop any rows with obvious missing predictors or targets
-    df = df.dropna(
-        subset=[
-            "ice_conc_mean",
-            "ice_conc_prev",
-            "delta_ice",
-            "vessel_count",
-            "vessel_count_prev",
-            "has_vessel",
-            "vessel_count_next",
-            "has_vessel_next",
-            "month",
-            "t",
-            "lat",
-            "lon",
-        ]
-    ).reset_index(drop=True)
+def load_features():
+    print(f"Loading features from {FEATURES_PATH}")
+    df = pd.read_parquet(FEATURES_PATH)
 
-    # Ensure integer types for counts and logical flags
-    df["vessel_count"] = df["vessel_count"].astype(int)
-    df["vessel_count_prev"] = df["vessel_count_prev"].astype(int)
-    df["vessel_count_next"] = df["vessel_count_next"].astype(int)
-    df["has_vessel"] = df["has_vessel"].astype(int)
-    df["has_vessel_next"] = df["has_vessel_next"].astype(int)
+    # Create binary indicators if not already present
+    if "has_vessel" not in df.columns:
+        df["has_vessel"] = (df["vessel_count"] > 0).astype(int)
+    if "has_vessel_next" not in df.columns:
+        df["has_vessel_next"] = (df["vessel_count_next"] > 0).astype(int)
 
-    # Month as categorical with all 12 categories, to stabilize dummy columns
-    df["month"] = df["month"].astype(int)
-    df["month"] = pd.Categorical(df["month"], categories=list(range(1, 13)))
+    # One hot encode month for tree models and logistic
+    if "month" in df.columns:
+        df = pd.get_dummies(df, columns=["month"], prefix="month")
 
     return df
 
 
-def filter_active_cells(df: pd.DataFrame, min_total_vessels: int = 5) -> pd.DataFrame:
+def filter_active_cells(df, min_total_vessels=ACTIVE_CELL_MIN_TOTAL_VESSELS):
     """
-    Restrict to grid cells that ever see at least min_total_vessels detections
-    over the full time period. This removes vast regions of permanently empty ocean.
+    Keep only grid cells (iy, ix) with at least min_total_vessels over the record.
     """
     print("Filtering to active grid cells...")
-    cell_totals = df.groupby(["iy", "ix"])["vessel_count"].sum()
-    active_idx = cell_totals[cell_totals >= min_total_vessels].index
+    group = df.groupby(["iy", "ix"])["vessel_count"].sum()
+    active_index = group[group >= min_total_vessels].index
 
-    before_rows = len(df)
     before_cells = df[["iy", "ix"]].drop_duplicates().shape[0]
+    before_rows = len(df)
 
-    df_active = (
-        df.set_index(["iy", "ix"])
-        .loc[active_idx]
-        .reset_index()
-        .sort_values(["iy", "ix", "t"])
-        .reset_index(drop=True)
-    )
+    active_mask = df.set_index(["iy", "ix"]).index.isin(active_index)
+    df_active = df[active_mask].copy()
 
-    after_rows = len(df_active)
     after_cells = df_active[["iy", "ix"]].drop_duplicates().shape[0]
+    after_rows = len(df_active)
 
     print(
         f"Active cells filter: {before_cells} cells -> {after_cells} cells, "
         f"{before_rows} rows -> {after_rows} rows."
     )
-
     return df_active
 
 
-def ensure_out_dir():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def time_train_test_split(df: pd.DataFrame, test_fraction: float = 0.2):
+def time_split(df, target_col):
     """
-    Time based train test split using t as time index.
+    Train/test split by time index t using TRAIN_FRACTION.
+    Drops rows where target is missing.
+    (Used by older code; RF functions now do their own split with feature NaN handling.)
     """
-    t_sorted = np.sort(df["t"].unique())
-    cutoff_index = int(np.floor((1.0 - test_fraction) * len(t_sorted)))
-    cutoff_t = t_sorted[cutoff_index]
-
-    train_df = df[df["t"] <= cutoff_t].copy()
-    test_df = df[df["t"] > cutoff_t].copy()
+    df = df.dropna(subset=[target_col]).copy()
+    t_cut = df["t"].quantile(TRAIN_FRACTION)
+    train_mask = df["t"] <= t_cut
+    df_train = df[train_mask].copy()
+    df_test = df[~train_mask].copy()
 
     print(
-        f"Train period t <= {cutoff_t}, "
-        f"train n = {len(train_df)}, test n = {len(test_df)}"
+        f"Train period t <= {t_cut:.0f}, "
+        f"train n = {len(df_train):d}, test n = {len(df_test):d}"
     )
-    return train_df, test_df
+    return df_train, df_test
 
 
-# ---------------------------------------------------------------------
-# EDA
-# ---------------------------------------------------------------------
-
-
-def eda_prob_vs_ice(df: pd.DataFrame, n_bins: int = 20):
+def plot_prob_vs_ice(df, out_path):
     """
-    Plot probability of vessel presence (this month) as a function of ice concentration
-    for active cells.
+    Plot empirical probability of vessel presence vs ice concentration
+    in active cells.
     """
     print("Running EDA: probability of vessel presence vs ice concentration (active cells)")
+    # use ice_conc_mean, bin from 0 to 1
+    bins = np.linspace(0.0, 1.0, 11)
+    df = df.copy()
+    df["ice_bin"] = pd.cut(df["ice_conc_mean"], bins=bins, include_lowest=True)
+    # observed=False to match current pandas default and silence FutureWarning
+    grouped = df.groupby("ice_bin", observed=False)["has_vessel"].mean().reset_index()
+    # Representative bin centers for x-axis
+    bin_centers = [
+        interval.left + (interval.right - interval.left) / 2.0
+        for interval in grouped["ice_bin"]
+    ]
 
-    ice = df["ice_conc_mean"].clip(0.0, 1.0)
-    has_vessel = df["has_vessel"]
-
-    bins = np.linspace(0.0, 1.0, n_bins + 1)
-    bin_ids = np.digitize(ice, bins) - 1
-    bin_centers = 0.5 * (bins[:-1] + bins[1:])
-
-    prob = []
-    counts = []
-    for b in range(n_bins):
-        mask = bin_ids == b
-        if mask.sum() == 0:
-            prob.append(np.nan)
-            counts.append(0)
-        else:
-            prob.append(has_vessel[mask].mean())
-            counts.append(mask.sum())
-
-    prob = np.array(prob)
-    counts = np.array(counts)
-
-    plt.figure()
-    plt.plot(bin_centers, prob, marker="o")
+    plt.figure(figsize=(7, 5))
+    plt.plot(bin_centers, grouped["has_vessel"], marker="o")
     plt.xlabel("Ice concentration (fraction)")
     plt.ylabel("P(has_vessel = 1)")
     plt.title("Probability of vessel presence vs ice concentration (active cells)")
-    plt.grid(True)
-
-    out_path = OUT_DIR / "eda_prob_vs_ice_active.png"
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
     plt.close()
     print(f"Saved EDA plot to {out_path}")
 
 
-# ---------------------------------------------------------------------
-# Modeling helpers
-# ---------------------------------------------------------------------
+def plot_roc(y_true, y_prob, title, out_path):
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+    plt.plot([0, 1], [0, 1], linestyle="--", color="orange")
+    plt.xlabel("False positive rate")
+    plt.ylabel("True positive rate")
+    plt.title(title)
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"Saved ROC plot to {out_path}")
+    return roc_auc
 
 
-def build_full_feature_matrix(df: pd.DataFrame, next_month: bool = True):
+def plot_feature_importance(model, feature_names, out_path, top_n=20):
+    importances = model.feature_importances_
+    idx = np.argsort(importances)[::-1][:top_n]
+    top_features = np.array(feature_names)[idx]
+    top_importances = importances[idx]
+
+    plt.figure(figsize=(8, 6))
+    plt.barh(range(len(top_features)), top_importances[::-1])
+    plt.yticks(range(len(top_features)), top_features[::-1])
+    plt.xlabel("Feature importance")
+    plt.title("Random Forest feature importance (top {})".format(top_n))
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"Saved RF feature importance to {out_path}")
+
+
+def plot_regressor_scatter(y_true, y_pred, out_path):
+    plt.figure(figsize=(7, 5))
+    plt.scatter(y_true, y_pred, s=5, alpha=0.5)
+    max_val = max(y_true.max(), y_pred.max())
+    plt.plot([0, max_val], [0, max_val], linestyle="--")
+    plt.xlabel("Actual vessel_count_next")
+    plt.ylabel("Predicted vessel_count_next")
+    plt.title("RF regressor: predicted vs actual vessel_count_next")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"Saved RF regressor scatter to {out_path}")
+
+
+# -------------------------------------------------------------------
+# Model runners
+# -------------------------------------------------------------------
+
+def run_logistic_next_ice_only(df, metrics_lines):
     """
-    Build X, y for RF models.
-    If next_month is True, y is has_vessel_next or vessel_count_next; the caller
-    chooses which column to use.
+    Logistic regression for next-month presence using only ice and month.
+    Drops any rows with NaNs in the feature set.
     """
-    X = df[
-        [
-            "ice_conc_mean",
-            "ice_conc_prev",
-            "delta_ice",
-            "vessel_count",
-            "vessel_count_prev",
-            "lat",
-            "lon",
-            "month",
-        ]
-    ].copy()
+    target_col = "has_vessel_next"
 
-    X = pd.get_dummies(X, columns=["month"], drop_first=True)
-    feature_names = X.columns.tolist()
-    return X.values, feature_names
+    # feature set: ice + month dummies
+    month_cols = [c for c in df.columns if c.startswith("month_")]
+    feature_cols = ["ice_conc_mean", "ice_conc_prev", "delta_ice"] + month_cols
 
+    # keep only rows where both features and target are non-missing
+    cols_for_model = feature_cols + [target_col, "t"]
+    df_model = df[cols_for_model].dropna().copy()
 
-def build_ice_only_matrix(df: pd.DataFrame):
-    """
-    Features for the logistic baseline: ice + season only, predicting has_vessel_next.
-    """
-    X = df[["ice_conc_mean", "ice_conc_prev", "delta_ice", "month"]].copy()
-    X = pd.get_dummies(X, columns=["month"], drop_first=True)
-    feature_names = X.columns.tolist()
-    return X.values, feature_names
+    # time-based split on the cleaned subset
+    t_cut = df_model["t"].quantile(TRAIN_FRACTION)
+    train_mask = df_model["t"] <= t_cut
+    df_train = df_model[train_mask].copy()
+    df_test = df_model[~train_mask].copy()
 
+    print(
+        f"Running logistic regression for has_vessel_next (ice + season only)\n"
+        f"Train period t <= {t_cut:.0f}, train n = {len(df_train)}, test n = {len(df_test)}"
+    )
 
-# ---------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------
+    X_train = df_train[feature_cols].values
+    y_train = df_train[target_col].values
+    X_test = df_test[feature_cols].values
+    y_test = df_test[target_col].values
 
-
-def run_logistic_next(df: pd.DataFrame, metrics_file):
-    """
-    Logistic regression baseline:
-        Predict has_vessel_next using only ice variables + season (no location,
-        no vessel history). This isolates what ice alone can do.
-    """
-    print("Running logistic regression for has_vessel_next (ice + season only)")
-
-    train_df, test_df = time_train_test_split(df)
-
-    X_train, feat_names = build_ice_only_matrix(train_df)
-    X_test, _ = build_ice_only_matrix(test_df)
-
-    y_train = train_df["has_vessel_next"].values
-    y_test = test_df["has_vessel_next"].values
-
-    clf = Pipeline(
+    pipe = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
-            ("logreg", LogisticRegression(max_iter=1000)),
+            ("clf", LogisticRegression(max_iter=1000, n_jobs=-1)),
         ]
     )
 
-    clf.fit(X_train, y_train)
-    y_prob = clf.predict_proba(X_test)[:, 1]
+    pipe.fit(X_train, y_train)
+    y_prob = pipe.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= 0.5).astype(int)
 
-    auc = roc_auc_score(y_test, y_prob)
-    cm = confusion_matrix(y_test, y_pred)
-    report = classification_report(y_test, y_pred, digits=3)
+    roc_path = ANALYSIS_DIR / "logistic_next_roc.png"
+    auc_val = plot_roc(
+        y_test,
+        y_prob,
+        "Logistic ROC (has_vessel_next, ice + season only)",
+        roc_path,
+    )
 
-    print(f"Logistic (next-month, ice-only) AUC: {auc:.3f}")
+    cm = confusion_matrix(y_test, y_pred)
+    report = classification_report(y_test, y_pred)
+
+    print(f"Logistic (next-month, ice-only) AUC: {auc_val:.3f}")
     print("Confusion matrix:")
     print(cm)
     print("Classification report:")
     print(report)
 
-    metrics_file.write(
-        "\n=== Logistic Regression (has_vessel_next, ice + season only) ===\n"
+    metrics_lines.append(f"Logistic next-month (ice + season only) AUC: {auc_val:.3f}")
+    metrics_lines.append("Logistic confusion matrix (next-month, ice-only):")
+    metrics_lines.append(str(cm))
+    metrics_lines.append("Logistic classification report (next-month, ice-only):")
+    metrics_lines.append(report)
+    metrics_lines.append("")
+
+
+def run_rf_classifier_next_full(df, metrics_lines):
+    """
+    Random Forest classifier for next-month presence with full feature set.
+    Handles NaNs by dropping rows with missing feature values.
+    """
+    target_col = "has_vessel_next"
+
+    # full features (drop identifiers and targets)
+    drop_cols = [
+        "has_vessel",
+        "has_vessel_next",
+        "vessel_count_next",
+        "iy",
+        "ix",
+        "t",
+        "year",
+    ]
+    feature_cols = [c for c in df.columns if c not in drop_cols]
+
+    # keep only rows where both features and target are non-missing
+    cols_for_model = feature_cols + [target_col, "t"]
+    df_model = df[cols_for_model].dropna().copy()
+
+    # time-based split on the cleaned subset
+    t_cut = df_model["t"].quantile(TRAIN_FRACTION)
+    train_mask = df_model["t"] <= t_cut
+    df_train = df_model[train_mask].copy()
+    df_test = df_model[~train_mask].copy()
+
+    print(
+        f"Train period t <= {t_cut:.0f}, "
+        f"train n = {len(df_train):d}, test n = {len(df_test):d}"
     )
-    metrics_file.write(f"AUC: {auc:.3f}\n")
-    metrics_file.write("Confusion matrix:\n")
-    metrics_file.write(str(cm) + "\n")
-    metrics_file.write("Classification report:\n")
-    metrics_file.write(report + "\n")
 
-    # ROC curve
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
-    plt.figure()
-    plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
-    plt.plot([0, 1], [0, 1], linestyle="--")
-    plt.xlabel("False positive rate")
-    plt.ylabel("True positive rate")
-    plt.title("Logistic ROC (has_vessel_next, ice + season only)")
-    plt.legend()
-    plt.grid(True)
+    X_train = df_train[feature_cols].values
+    y_train = df_train[target_col].values
+    X_test = df_test[feature_cols].values
+    y_test = df_test[target_col].values
 
-    out_path = OUT_DIR / "logistic_next_roc.png"
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved logistic ROC to {out_path}")
-
-
-def run_rf_classifier(df: pd.DataFrame, metrics_file):
-    """
-    Random Forest classifier:
-        Predict has_vessel_next using full feature set (ice, history, lat, lon, season).
-    """
-    print("Running Random Forest classifier for has_vessel_next (full features)")
-
-    train_df, test_df = time_train_test_split(df)
-
-    X_train, feature_names = build_full_feature_matrix(train_df, next_month=True)
-    X_test, _ = build_full_feature_matrix(test_df, next_month=True)
-
-    y_train = train_df["has_vessel_next"].values
-    y_test = test_df["has_vessel_next"].values
-
-    rf = RandomForestClassifier(
+    clf = RandomForestClassifier(
         n_estimators=200,
         max_depth=None,
-        min_samples_split=5,
-        min_samples_leaf=2,
         n_jobs=-1,
         random_state=42,
     )
-    rf.fit(X_train, y_train)
 
-    y_prob = rf.predict_proba(X_test)[:, 1]
-    y_pred = (y_prob >= 0.5).astype(int)
+    print("Running Random Forest classifier for has_vessel_next (full features)")
+    clf.fit(X_train, y_train)
+    y_prob = clf.predict_proba(X_test)[:, 1]
+    y_pred = clf.predict(X_test)
 
-    auc = roc_auc_score(y_test, y_prob)
+    roc_path = ANALYSIS_DIR / "rf_classifier_roc.png"
+    auc_val = plot_roc(
+        y_test,
+        y_prob,
+        "Random Forest ROC (has_vessel_next)",
+        roc_path,
+    )
+
     cm = confusion_matrix(y_test, y_pred)
-    report = classification_report(y_test, y_pred, digits=3)
+    report = classification_report(y_test, y_pred)
 
-    print(f"RF classifier AUC: {auc:.3f}")
+    print(f"RF classifier AUC: {auc_val:.3f}")
     print("RF classifier confusion matrix:")
     print(cm)
     print("RF classifier classification report:")
     print(report)
 
-    metrics_file.write("\n=== Random Forest Classifier (has_vessel_next, full) ===\n")
-    metrics_file.write(f"AUC: {auc:.3f}\n")
-    metrics_file.write("Confusion matrix:\n")
-    metrics_file.write(str(cm) + "\n")
-    metrics_file.write("Classification report:\n")
-    metrics_file.write(report + "\n")
+    metrics_lines.append(f"RF classifier (has_vessel_next) AUC: {auc_val:.3f}")
+    metrics_lines.append("RF classifier confusion matrix:")
+    metrics_lines.append(str(cm))
+    metrics_lines.append("RF classifier classification report:")
+    metrics_lines.append(report)
+    metrics_lines.append("")
 
-    # ROC curve
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
-    plt.figure()
-    plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
-    plt.plot([0, 1], [0, 1], linestyle="--")
-    plt.xlabel("False positive rate")
-    plt.ylabel("True positive rate")
-    plt.title("Random Forest ROC (has_vessel_next)")
-    plt.legend()
-    plt.grid(True)
-    out_path = OUT_DIR / "rf_classifier_roc.png"
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved RF classifier ROC to {out_path}")
-
-    # Feature importance
-    importances = rf.feature_importances_
-    idx = np.argsort(importances)[::-1]
-    sorted_features = [feature_names[i] for i in idx]
-    sorted_importances = importances[idx]
-
-    plt.figure(figsize=(8, 6))
-    top_k = min(20, len(sorted_features))
-    plt.barh(sorted_features[:top_k][::-1], sorted_importances[:top_k][::-1])
-    plt.xlabel("Feature importance")
-    plt.title("Random Forest feature importance (top 20)")
-    plt.tight_layout()
-    out_path = OUT_DIR / "rf_classifier_feature_importance.png"
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved RF classifier feature importance to {out_path}")
-
-    metrics_file.write("Feature importances (descending):\n")
-    for fname, imp in zip(sorted_features, sorted_importances):
-        metrics_file.write(f"{fname}: {imp:.4f}\n")
+    fi_path = ANALYSIS_DIR / "rf_classifier_feature_importance.png"
+    plot_feature_importance(clf, feature_cols, fi_path)
 
 
-def run_rf_regressor(df: pd.DataFrame, metrics_file):
+def run_rf_regressor_next(df, metrics_lines):
     """
-    Random Forest regressor for vessel_count_next.
+    Random Forest regressor for next-month counts.
+    Handles NaNs by dropping rows with missing feature values.
     """
-    print("Running Random Forest regressor for vessel_count_next")
+    target_col = "vessel_count_next"
 
-    train_df, test_df = time_train_test_split(df)
+    drop_cols = [
+        "has_vessel",
+        "has_vessel_next",
+        "vessel_count_next",
+        "iy",
+        "ix",
+        "t",
+        "year",
+    ]
+    feature_cols = [c for c in df.columns if c not in drop_cols]
 
-    X_train, feature_names = build_full_feature_matrix(train_df, next_month=True)
-    X_test, _ = build_full_feature_matrix(test_df, next_month=True)
+    # keep only rows where both features and target are non-missing
+    cols_for_model = feature_cols + [target_col, "t"]
+    df_model = df[cols_for_model].dropna().copy()
 
-    y_train = train_df["vessel_count_next"].values
-    y_test = test_df["vessel_count_next"].values
+    # time-based split on the cleaned subset
+    t_cut = df_model["t"].quantile(TRAIN_FRACTION)
+    train_mask = df_model["t"] <= t_cut
+    df_train = df_model[train_mask].copy()
+    df_test = df_model[~train_mask].copy()
 
-    rf = RandomForestRegressor(
+    print(
+        f"Train period t <= {t_cut:.0f}, "
+        f"train n = {len(df_train):d}, test n = {len(df_test):d}"
+    )
+
+    X_train = df_train[feature_cols].values
+    y_train = df_train[target_col].values
+    X_test = df_test[feature_cols].values
+    y_test = df_test[target_col].values
+
+    reg = RandomForestRegressor(
         n_estimators=200,
         max_depth=None,
-        min_samples_split=5,
-        min_samples_leaf=2,
         n_jobs=-1,
         random_state=42,
     )
-    rf.fit(X_train, y_train)
-    y_pred = rf.predict(X_test)
+
+    print("Running Random Forest regressor for vessel_count_next")
+    reg.fit(X_train, y_train)
+    y_pred = reg.predict(X_test)
 
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     r2 = r2_score(y_test, y_pred)
-
     print(f"RF regressor RMSE: {rmse:.3f}")
     print(f"RF regressor R2: {r2:.3f}")
 
-    metrics_file.write("\n=== Random Forest Regressor (vessel_count_next) ===\n")
-    metrics_file.write(f"RMSE: {rmse:.3f}\n")
-    metrics_file.write(f"R2: {r2:.3f}\n")
+    metrics_lines.append(f"RF regressor vessel_count_next RMSE: {rmse:.3f}")
+    metrics_lines.append(f"RF regressor vessel_count_next R2: {r2:.3f}")
+    metrics_lines.append("")
 
-    # Scatter plot predicted vs actual
-    plt.figure()
-    plt.scatter(y_test, y_pred, s=5, alpha=0.5)
-    max_val = max(y_test.max(), y_pred.max())
-    plt.plot([0, max_val], [0, max_val], linestyle="--")
-    plt.xlabel("Actual vessel_count_next")
-    plt.ylabel("Predicted vessel_count_next")
-    plt.title("RF regressor: predicted vs actual vessel_count_next")
-    plt.grid(True)
-    out_path = OUT_DIR / "rf_regressor_scatter.png"
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"Saved RF regressor scatter to {out_path}")
+    scatter_path = ANALYSIS_DIR / "rf_regressor_scatter.png"
+    plot_regressor_scatter(y_test, y_pred, scatter_path)
 
 
-# ---------------------------------------------------------------------
+# -------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------
-
+# -------------------------------------------------------------------
 
 def main():
-    ensure_out_dir()
-    df = load_data()
-    df = filter_active_cells(df, min_total_vessels=5)
+    ensure_output_dir()
+    df = load_features()
+    df = filter_active_cells(df)
 
-    metrics_path = OUT_DIR / "metrics.txt"
+    # compute has_vessel for current month if needed
+    if "has_vessel" not in df.columns:
+        df["has_vessel"] = (df["vessel_count"] > 0).astype(int)
 
-    tracker = None
-    if HAS_CODEC:
-        print("Starting CodeCarbon EmissionsTracker...")
-        tracker = EmissionsTracker(
-            project_name="dsan5550_ice_vessels",
-            output_dir=str(OUT_DIR),
-            output_file="emissions.csv",
-            save_to_file=True,
+    # EDA: probability vs ice in active cells
+    eda_path = ANALYSIS_DIR / "eda_prob_vs_ice_active.png"
+    plot_prob_vs_ice(df, eda_path)
+
+    metrics_lines = []
+
+    # CodeCarbon tracker
+    tracker = EmissionsTracker(
+        project_name="dsan5550_ice_vessels",
+        output_dir=str(ANALYSIS_DIR),
+        output_file="emissions.csv",
+        save_to_file=True,
+    )
+    print("Starting CodeCarbon EmissionsTracker...")
+    tracker.start()
+
+    try:
+        run_logistic_next_ice_only(df, metrics_lines)
+        run_rf_classifier_next_full(df, metrics_lines)
+        run_rf_regressor_next(df, metrics_lines)
+    finally:
+        emissions_kg = tracker.stop()
+        print(
+            f"CodeCarbon reported total emissions: {emissions_kg:.6f} kg CO2eq "
+            f"(see {ANALYSIS_DIR / 'emissions.csv'})"
         )
-        tracker.start()
-    else:
-        print("CodeCarbon not installed; skipping emissions tracking.")
+        metrics_lines.append(f"Total emissions (kg CO2eq): {emissions_kg:.6f}")
 
-    with open(metrics_path, "w") as metrics_file:
-        metrics_file.write("Vessel and sea ice model metrics (active cells only)\n")
-
-        eda_prob_vs_ice(df)
-        run_logistic_next(df, metrics_file)
-        run_rf_classifier(df, metrics_file)
-        run_rf_regressor(df, metrics_file)
-
-        if tracker is not None:
-            emissions_kg = tracker.stop()
-            metrics_file.write("\n=== CodeCarbon ===\n")
-            metrics_file.write(f"Total emissions (kg CO2eq): {emissions_kg:.6f}\n")
-            print(
-                f"CodeCarbon reported total emissions: {emissions_kg:.6f} kg CO2eq "
-                f"(see {OUT_DIR / 'emissions.csv'})"
-            )
-
+    metrics_path = ANALYSIS_DIR / "metrics.txt"
+    with open(metrics_path, "w") as f:
+        for line in metrics_lines:
+            f.write(line.rstrip("\n") + "\n")
     print(f"All metrics written to {metrics_path}")
 
 
