@@ -10,6 +10,9 @@ OUTPUT_CSV = "/Users/brycegrover/Desktop/DSAN/FALL_2025/DSAN5550/Project/sea_ice
 NORTH_GRID_NAME = "NpPolarGrid12km"
 ICE_VAR_NAME = "SI_12km_NH_ICECON_DAY"
 
+# CHAT GPT USED TO MAKE BELOW CODE
+# BEGIN AI CODE
+
 def extract_date(filename: str) -> pd.Timestamp:
     m = re.search(r"_(\d{8})\.he5$", filename)
     if not m:
@@ -59,3 +62,5 @@ for fname in files:
 df = pd.DataFrame(rows).sort_values("date")
 df.to_csv(OUTPUT_CSV, index=False)
 print("Wrote:", OUTPUT_CSV)
+
+# END AI CODE

@@ -27,7 +27,7 @@ for fname in files:
     out_csv = os.path.join(OUT_DIR, f"ice_grid_{date_str}.csv")
 
     if os.path.exists(out_csv):
-        print("Skipping existing", out_csv)
+        print("Skipping existing files", out_csv)
         continue
 
     fpath = os.path.join(DATA_DIR, fname)

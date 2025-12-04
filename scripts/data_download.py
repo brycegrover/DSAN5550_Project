@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# ---------------------------------------------------------------------------
-# Clean AU_SI12 Downloader
-#   - Downloads ONLY .he5 data files
-#   - Filters by year and month
-#   - Stores outputs in a clear directory
-#   - Leaves NSIDC authentication + CMR logic unchanged
-# ---------------------------------------------------------------------------
 
 from __future__ import print_function
 import base64, getopt, itertools, json, math, netrc, os, ssl, sys, time
@@ -21,28 +14,19 @@ except ImportError:
         urlopen, Request, HTTPError, URLError, build_opener, HTTPCookieProcessor
     )
 
-# ---------------------------------------------------------------------------
-# USER SETTINGS
-# ---------------------------------------------------------------------------
-
 short_name = "AU_SI12"
 version = "1"
-
-# Time range – adjust freely
 time_start = "2023-01-01T00:00:00Z"
 time_end   = "2025-11-12T23:59:59Z"
 
-# Spatial region – Arctic only
+# arctic bounds
 bounding_box = "-180,65,180,90"
 polygon = ""
 filename_filter = ""
 url_list = []
 
-# Directory to save downloaded files
 download_dir = "/Users/brycegrover/Desktop/DSAN/FALL_2025/DSAN5550/Project/data"
 
-# Download only these year-month patterns
-# Adjust to your needs
 keep_patterns = [
     "202306","202307","202308","202309","202310",
     "202406","202407","202408","202409","202410",
@@ -62,8 +46,8 @@ CMR_COLLECTIONS_URL = "{0}/search/collections.json?".format(CMR_URL)
 FILE_DOWNLOAD_MAX_RETRIES = 3
 
 # ---------------------------------------------------------------------------
-# AUTH + UTILS
-# ---------------------------------------------------------------------------
+# CHATGPT HELPED CREATE THE BELOW FUNCTIONS
+# BEGIN AI CODE
 
 def get_username():
     try: do_input = raw_input
@@ -197,14 +181,11 @@ def get_login_response(url, credentials, token):
     try:
         return opener.open(req)
     except HTTPError as e:
-        if "Unauthorized" in e.reason:
-            print("Unauthorized. Check username/password or token.")
+        if "problem" in e.reason:
+            print("wrong pass or user")
             sys.exit(1)
         raise
 
-# ---------------------------------------------------------------------------
-# CMR SEARCH + DOWNLOAD
-# ---------------------------------------------------------------------------
 
 def check_provider_for_collection(short_name, version, provider):
     q = build_query_params_str(short_name,version,provider=provider)
@@ -257,7 +238,7 @@ def cmr_search(short_name, version, time_start, time_end,
     )
 
     if not quiet:
-        print("Querying:\n ", cmr_url, "\n")
+        print("finding:\n ", cmr_url, "\n")
 
     paging_header = "cmr-search-after"
     page_id = None
@@ -278,7 +259,7 @@ def cmr_search(short_name, version, time_start, time_end,
 
         if not page_id:
             hits = int(headers["cmr-hits"])
-            print("Found", hits, "matches.")
+            print("there are ", hits, "matches.")
 
         page_id = headers.get(paging_header)
 
@@ -292,12 +273,12 @@ def cmr_search(short_name, version, time_start, time_end,
 
 def cmr_download(urls, force=False, quiet=False):
     if not urls:
-        print("No files to download.")
+        print("nothi9ng found.")
         return
 
     os.makedirs(download_dir, exist_ok=True)
 
-    print("Downloading", len(urls), "files...")
+    print("downloading", len(urls), "files...")
 
     credentials = None
     token = None
@@ -319,7 +300,7 @@ def cmr_download(urls, force=False, quiet=False):
 
                 if not force and os.path.exists(path):
                     if os.path.getsize(path) == length:
-                        print("  File exists, skipping.")
+                        print("ALready exists, skiiping")
                         break
 
                 chunk_size = min(max(length,1), 1024*1024)
@@ -338,15 +319,11 @@ def cmr_download(urls, force=False, quiet=False):
                 break
 
             except Exception as e:
-                print("Error downloading:", e)
+                print("problem with downloading:", e)
                 if attempt == FILE_DOWNLOAD_MAX_RETRIES:
-                    print("Failed permanently:", fname)
+                    print("ERROR:", fname)
                     sys.exit(1)
 
-
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
 
 def main(argv=None):
     global url_list
@@ -360,12 +337,10 @@ def main(argv=None):
             if o in ("-f","--force"): force=True
             elif o in ("-q","--quiet"): quiet=True
             elif o in ("-h","--help"):
-                print("usage: python data_download.py [-f] [-q]")
                 sys.exit(0)
     except:
-        print("Bad args."); sys.exit(1)
+        print("ERROR."); sys.exit(1)
 
-    # Query
     url_list = cmr_search(
         short_name,version,
         time_start,time_end,
@@ -373,16 +348,19 @@ def main(argv=None):
         quiet=quiet
     )
 
-    # Filter to melt season & only .he5
+    # Filter to right season & only .he5
     filtered = []
     for u in url_list:
         if u.endswith(".he5") and any(pat in u for pat in keep_patterns):
             filtered.append(u)
 
-    print(f"After month + .he5 filtering: kept {len(filtered)} of {len(url_list)} URLs.")
+    print(f"After month + .he5 filtering: kept {len(filtered)} of {len(url_list)} urls.")
 
     cmr_download(filtered, force=force, quiet=quiet)
 
 
 if __name__ == "__main__":
     main()
+
+# END AI CODE
+# ---------------------------------------------------------------------------

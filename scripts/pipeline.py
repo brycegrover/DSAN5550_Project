@@ -37,10 +37,9 @@ def build_or_load_grid_index():
         tree = KDTree(lat_lon, metric="euclidean")
         return meta, tree
 
-    print("Building grid index from first ice CSV")
 
     ice_files = sorted(RAW_ICE_DIR.glob("ice_grid_*.csv"))
-    if not ice_files:
+    if not ice_files: # debug
         raise FileNotFoundError(f"No ice_grid_*.csv files found in {RAW_ICE_DIR}")
 
     sample = pd.read_csv(ice_files[0], usecols=["iy", "ix", "lat", "lon"])
@@ -52,15 +51,14 @@ def build_or_load_grid_index():
     meta.to_csv(grid_meta_csv, index=False)
     np.savez_compressed(grid_npz, lat_lon=lat_lon)
 
-    print(f"Grid index built with {len(meta)} cells")
     return meta, tree
 
 
 def load_grid_index():
     grid_meta_csv = GRID_DIR / "grid_lookup.csv"
     grid_npz = GRID_DIR / "grid_kdtree.npz"
-    if not (grid_meta_csv.exists() and grid_npz.exists()):
-        raise FileNotFoundError("Grid index not found. Run build_or_load_grid_index() first.")
+    if not (grid_meta_csv.exists() and grid_npz.exists()): # debug
+        raise FileNotFoundError("Grid index not found")
     meta = pd.read_csv(grid_meta_csv)
     lat_lon = np.load(grid_npz)["lat_lon"]
     tree = KDTree(lat_lon, metric="euclidean")
@@ -71,19 +69,19 @@ def load_grid_index():
 def process_ice_daily_to_monthly():
 
     ice_files = sorted(RAW_ICE_DIR.glob("ice_grid_*.csv"))
-    if not ice_files:
+    if not ice_files: # debug
         raise FileNotFoundError(f"No ice_grid_*.csv files found in {RAW_ICE_DIR}")
 
     files_by_ym = defaultdict(list)
     for fpath in ice_files:
         fname = fpath.name
-        date_str = fname.split("_")[2].split(".")[0]  # 'YYYYMMDD'
+        date_str = fname.split("_")[2].split(".")[0]  # yyyymmdd
         year = int(date_str[:4])
         month = int(date_str[4:6])
         files_by_ym[(year, month)].append(fpath)
 
     for (year, month), paths in sorted(files_by_ym.items()):
-        print(f"[ICE] Year {year}, month {month:02d}: {len(paths)} daily files")
+        print(f"Year {year}, month {month:02d}: {len(paths)} daily files")
 
         frames = []
         for p in paths:
@@ -110,7 +108,7 @@ def process_ice_daily_to_monthly():
         agg.to_parquet(out_file, index=False)
         print(f"  Wrote {out_file} with {len(agg)} grid cells")
 
-    print("Ice monthly aggregation complete.")
+    print("done aggregating")
 
 
 def map_points_to_grid(lat, lon, tree, grid_meta, max_deg_distance=5.0):
@@ -147,7 +145,6 @@ def process_vessels_to_monthly(chunk_size=500_000):
             if chunk.empty:
                 continue
 
-
             chunk["timestamp"] = pd.to_datetime(
                 chunk["timestamp"], utc=True, errors="coerce"
             )
@@ -181,7 +178,7 @@ def process_vessels_to_monthly(chunk_size=500_000):
             monthly_chunks.append(grp)
 
     if not monthly_chunks:
-        print("No vessel detections survived filtering.")
+        print("everything was dropped")
         return
 
     all_monthly = pd.concat(monthly_chunks, ignore_index=True)
@@ -193,7 +190,7 @@ def process_vessels_to_monthly(chunk_size=500_000):
 
     out_file = VESSELS_MONTHLY_DIR / "vessels_monthly.parquet"
     vessels_monthly.to_parquet(out_file, index=False)
-    print(f"Vessel monthly aggregation complete: {out_file} ({len(vessels_monthly)} rows)")
+    print(f"completed: {out_file} ({len(vessels_monthly)} rows)")
 
 
 def build_feature_table():
@@ -206,7 +203,7 @@ def build_feature_table():
 
     vessels_path = VESSELS_MONTHLY_DIR / "vessels_monthly.parquet"
     if not vessels_path.exists():
-        raise FileNotFoundError(f"{vessels_path} not found; run process_vessels_to_monthly() first.")
+        raise FileNotFoundError(f"{vessels_path} not found")
     vessels = pd.read_parquet(vessels_path)
 
     df = pd.merge(
@@ -235,16 +232,16 @@ def run_all():
     print("Step 1: Grid index")
     build_or_load_grid_index()
 
-    print("Step 2: Ice daily -> monthly")
+    print("Step 2: Ice daily to monthly")
     process_ice_daily_to_monthly()
 
-    print("Step 3: Vessels -> monthly grid counts")
+    print("Step 3: Vessels to monthly grid counts")
     process_vessels_to_monthly()
 
     print("Step 4: Build feature table")
     build_feature_table()
 
-    print("Pipeline complete.")
+    print("Done.")
 
 
 if __name__ == "__main__":

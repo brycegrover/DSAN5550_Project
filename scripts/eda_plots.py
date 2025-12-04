@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-eda_plots.py
-
-Creates EDA plots for poster:
-- Class imbalance for current and next-month presence
-- Distributions of vessel counts and ice concentration
-- Time series of total vessel activity
-- Spatial map of active cells
-
-Plots are saved to processed/analysis.
-"""
 
 from pathlib import Path
 
@@ -72,13 +61,13 @@ def plot_histogram(df, col, out_name, bins=50, xlim=None, logy=False):
 
 
 def plot_time_series_total_vessels(df, out_name):
-    # group by year, month
+    # group by year month
     if "year" not in df.columns or "month" not in df.columns:
-        print("year or month not found. Skipping time series plot.")
+        print("year or month not found")
         return
 
     ts = df.groupby(["year", "month"])["vessel_count"].sum().reset_index()
-    # simple datetime index: assume day 1
+    # assume day 1
     ts["date"] = pd.to_datetime(
         ts["year"].astype(int).astype(str) + "-" + ts["month"].astype(int).astype(str) + "-01"
     )
@@ -98,9 +87,6 @@ def plot_time_series_total_vessels(df, out_name):
 
 
 def plot_spatial_active_map(df, out_name, min_total_vessels=5):
-    """
-    Simple spatial plot of active cells colored by mean vessel_count.
-    """
     group = df.groupby(["iy", "ix"]).agg(
         total_vessels=("vessel_count", "sum"),
         lat=("lat", "mean"),
@@ -110,7 +96,7 @@ def plot_spatial_active_map(df, out_name, min_total_vessels=5):
 
     active = group[group["total_vessels"] >= min_total_vessels].copy()
     if active.empty:
-        print("No active cells found. Skipping spatial map.")
+        print("No active cells found")
         return
 
     plt.figure(figsize=(6, 5))
@@ -124,7 +110,7 @@ def plot_spatial_active_map(df, out_name, min_total_vessels=5):
     plt.colorbar(scatter, label="Mean monthly vessel count")
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
-    plt.title("Active Arctic grid cells (mean vessel activity)")
+    plt.title("Active Arctic grid cells")
     plt.tight_layout()
     out_path = ANALYSIS_DIR / out_name
     plt.savefig(out_path, dpi=200)
@@ -136,13 +122,13 @@ def main():
     ensure_output_dir()
     df = load_features()
 
-    # 1. Class imbalance
+    # class imbalance
     if "has_vessel" in df.columns:
         plot_class_imbalance(df, "has_vessel", "class_imbalance_has_vessel.png")
     if "has_vessel_next" in df.columns:
         plot_class_imbalance(df, "has_vessel_next", "class_imbalance_has_vessel_next.png")
 
-    # 2. Distributions
+    # distributions
     plot_histogram(df, "vessel_count", "hist_vessel_count.png",
                    bins=50, xlim=(0, 50), logy=True)
     if "vessel_count_next" in df.columns:
@@ -153,10 +139,10 @@ def main():
         plot_histogram(df, "ice_conc_mean", "hist_ice_conc_mean.png",
                        bins=30, xlim=(0, 1.0), logy=False)
 
-    # 3. Time series of total vessels
+    # time series of total vessels
     plot_time_series_total_vessels(df, "time_series_total_vessels.png")
 
-    # 4. Spatial active cell map
+    # spatial active cell map
     plot_spatial_active_map(df, "spatial_active_cells.png", min_total_vessels=5)
 
 
